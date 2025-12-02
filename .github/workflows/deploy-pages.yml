@@ -1,5 +1,11 @@
 name: Deploy to GitHub Pages
 
+# Grant the workflow the permissions needed to push to the repository and Pages
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
 on:
   push:
     branches: [ main ]
@@ -7,8 +13,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
