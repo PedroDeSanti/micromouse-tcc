@@ -2,12 +2,28 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+
 // https://astro.build/config
 export default defineConfig({
   site: "https://tcc.desanti.dev/",
+  markdown: {
+    remarkPlugins: [remarkMath],
+    rehypePlugins: [rehypeKatex],
+  },
   integrations: [
     starlight({
       title: "Micras",
+      head: [
+        {
+          tag: "link",
+          attrs: {
+            rel: "stylesheet",
+            href: "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css",
+          },
+        },
+      ],
       social: [
         {
           icon: "github",
@@ -30,7 +46,7 @@ export default defineConfig({
         // },
 
         { label: "Computação", slug: "computação" },
-        { label: "Elétrica", slug: "elétrica" },
+        { label: "Elétrica", slug: "eletric" },
         { label: "Mecânica", slug: "mecânica" },
       ],
     }),

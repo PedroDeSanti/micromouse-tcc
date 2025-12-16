@@ -4,180 +4,69 @@ title: Computação
 
 ## Arquitetura de Software
 
-O firmware foi refatorado de uma arquitetura monolítica e procedural para um design modular e orientado a eventos. A transição utiliza o **State Pattern** para separar a lógica da navegação da implementação de hardware, permitindo maior flexibilidade e testabilidade.
+O firmware foi desenvolvido em **C++ Bare Metal**, mantendo a robusta arquitetura em camadas já estabelecida na versão anterior (Micras v1). O padrão **Hardware Proxy** foi fundamental para o sucesso do projeto: ao desacoplar rigidamente a lógica de navegação das especificidades do hardware, **não houve necessidade de portar código**.
 
-### Máquina de Estados (FSM)
+Graças a esse isolamento, os novos algoritmos de alto nível (como o *ActionQueuer* e o controle de velocidade) puderam ser desenvolvidos e validados diretamente na plataforma antiga (v1), sem exigir qualquer alteração nas camadas de baixo nível.
 
-O sistema opera em cinco estados principais:
+### Máquina de Estados Finita (FSM)
 
-- **Initialization (Init):** Verificação de hardware (IMU, sensores) e inicialização de periféricos
-- **Idle:** Estado padrão aguardando entrada do usuário
-- **Calibration:** Sintonia de sensores de parede e offset do giroscópio
-- **Run:** Estado ativo com navegação e exploração do labirinto
-- **Error:** Estado de segurança para falhas críticas de hardware
+Para superar as limitações de lógicas centralizadas, o controle foi refatorado utilizando o **State Pattern**. O sistema opera em estados discretos e isolados:
 
-### Abstração de Interface Humana (HMI)
+- **Initialization (Init):** Autoteste de hardware e configuração de periféricos.
+- **Idle:** Estado de baixo consumo aguardando comandos.
+- **Calibration:** Rotina isolada para normalização dos sensores IR e giroscópio.
+- **Run:** Estado ativo onde residem os algoritmos de navegação (Exploração ou Speed Run).
+- **Error:** *Trap state* de segurança para falhas críticas (ex: detecção de colisão).
 
-A camada Interface atua como ponte entre o mundo físico (botões, chaves) e o lógico (eventos, objetivos). O sistema mapeia entradas para eventos semânticos, permitindo controle por:
+### Interface e Telemetria
 
-- Botões físicos durante a competição
-- Chaves DIP para configuração (estratégia, performance, perfil de risco)
-- Controle remoto via Bluetooth através do módulo `micras_comm`
+A camada de Interface abstrai as entradas físicas em eventos semânticos (ex: `Event::EXPLORE`), permitindo que a estratégia seja definida via chaves DIP ou injetada remotamente.
+
+O sistema de comunicação (`micras_comm`) implementa um **Pool de Variáveis Seriais**, permitindo monitoramento e ajuste de constantes (PID, velocidade) em tempo real via Bluetooth, sem necessidade de recompilação.
 
 ---
 
-## Sistema de Navegação e Controle
+## Navegação e Inteligência
 
-O módulo `micras_nav` é o núcleo lógico responsável por percepção, planejamento de trajetória e execução de comandos motores. A refatoração migrou de uma abordagem reativa baseada em posição para uma arquitetura preditiva centrada em velocidade.
+O módulo `micras_nav` orquestra a percepção e o planejamento. A grande inovação desta versão é a transição de uma odometria global propensa a *drift* para uma **Odometria Local**, onde a posição é recalculada a cada ação discreta.
 
-### Componentes Principais
+### Localização e Percepção
 
-1. **Odometria:** Estimação de posição/velocidade via sensor fusion (encoders rotativos + IMU)
-2. **Mapa (Costmap):** Representação em grid 16×16 da estrutura do labirinto
-3. **Planejamento:** Algoritmos para exploração e cálculo da rota ótima
-4. **ActionQueuer:** Conversão de pontos de grid em ações motoras executáveis
-5. **SpeedController:** Controle de velocidade com feed-forward + PID
-
-### Percepção e Localização
-
-**Odometria com Fusão de Sensores:**
-
-- **Encoders:** Medição de rotação das rodas (resolução alta)
-- **Giroscópio (IMU):** Velocidade angular precisa, especialmente importante durante derrapagem
-- **Filtragem:** Butterworth filter suaviza ruído nas leituras de velocidade
-
-**Estratégia Odométrica Local:**
-
-- Em vez de rastrear posição global desde o início (acumula erro), o robô reseta sua referência ao iniciar cada ação
-- **Detecção de Posts:** Pelos sensores IR identifica bordas de paredes em interseções, "travando" a estimativa à grade conhecida
-- Limita o acúmulo de erro mesmo em corridas longas
+* **Odometria Local:** Em vez de rastrear coordenadas absolutas (X, Y) indefinidamente, o robô zera sua referência relativa ao iniciar cada movimento (ex: avançar 1 célula). Isso isola o erro acumulado a segmentos individuais.
+* **Fusão de Sensores:** Integração dos encoders magnéticos com o giroscópio (IMU) para manter a orientação precisa mesmo em caso de derrapagem das rodas.
+* **Correção de Posts:** O sistema detecta as bordas das paredes (posts) através da derivada do sinal dos sensores IR, usando esses marcos físicos para "zerar" o erro longitudinal ao entrar em uma nova célula.
 
 ### Mapeamento e Planejamento
 
-**Costmap (Flood Fill - BFS):**
+O robô utiliza representação em grafo (Grid 16x16) e algoritmos distintos para cada fase:
 
-- Grid 16×16 armazena estado das paredes e camadas de custo
-- Algoritmo BFS calcula distância mínima de cada célula para o alvo
-- Atualização eficiente quando novas informações de parede são detectadas
-
-**Exploração (BFS Frontier + Gradient Descent):**
-
-- `get_next_bfs_goal`: Encontra a célula não explorada mais próxima
-- Gradient descent: Segue o caminho de menor custo no Flood Fill
-- Paredes virtuais: Detecta dead-ends automaticamente e as marca para evitar revisitas
-
-**Rota Ótima (DFS com Backtracking):**
-
-- Calcula o caminho mais rápido considerando a dinâmica do robô (não apenas número de células)
-- Heurística com distância Manhattan para poda de ramos
-- Resultado: rota que minimiza tempo de travessia, não apenas comprimento geométrico
-
-### Planejamento de Movimento: Action Queue
-
-O `ActionQueuer` traduz decisões de navegação em sequências de ações atômicas (movimentos, rotações).
-
-**Tipos de Ações:**
-
-- START, MOVE_FORWARD, TURN, SPIN, DIAGONAL, STOP
-
-**Pipeline de Otimização (6 estágios):**
-
-1. **Geração primitiva:** Conversão de célula-célula em ações básicas
-2. **Injeção de diagonais:** Reconhece padrões em L e os converte em movimentos 45° (economia ~7% de tempo)
-3. **Consolidação:** Ações consecutivas do mesmo tipo são mescladas (ex: 3 MOVE → 1 MOVE de 3× distância)
-4. **Trimming de curvas:** Ajusta raios de curvatura para manter segurança em relação às paredes
-5. **Perfis dinâmicos:** Assign aceleração/desaceleração específicas de cada fase
-6. **Integração de curvas:** Transições suaves mantêm velocidade constante através de rotações
-
-**Modo Exploração vs. Solve:**
-
-- **Exploração:** Ações dinâmicas (1-2 à frente), dinâmica conservadora, seguimento de parede habilitado
-- **Solve:** Rota pré-compilada, dinâmica agressiva (aceleração máxima, velocidades altas), seguimento desabilitado
-
-### Controle de Movimento
-
-**Perfis Cinemáticos:**
-
-- **Movimentos lineares:** Perfil de velocidade trapezoidal (aceleração → velocidade constante → desaceleração)
-- **Rotações:** Perfil triangular de aceleração angular (suave, sem jerk)
-- Precisão de parada calculada com Torricelli: $v_f^2 = v_i^2 + 2a\Delta x$
-
-**Controle de Velocidade:**
-
-O sistema foi migrado de **controle de posição** para **controle de velocidade** para maior previsibilidade:
-
-- Posição é implicitamente mantida pela integração dos comandos de velocidade precisos
-- Dinâmica consistente e repetível
-- Permite entrada/saída de curvas em velocidades exatas
-
-**SpeedController (Cascata Feed-Forward + PID):**
-
-$$u(t) = \underbrace{K_v \cdot v_{ref}(t) + K_a \cdot a_{ref}(t)}_{\text{Feed-Forward}} + \underbrace{K_p e(t) + K_i \int e(t) \, dt + K_d \frac{de}{dt}}_{\text{PID}}$$
-
-- **Feed-Forward:** Calcula o comando motor necessário para atingir velocidade/aceleração desejadas *antes* de qualquer erro
-- **PID:** Correção reativa baseada no erro de velocidade ($e = v_{ref} - v_{actual}$)
-- Ganhos PID mais baixos (sistema mais suave) pois FF já faz a maior parte do trabalho
-
-### Wall Following (Seguimento de Parede)
-
-Proporciona correção lateral e angular em tempo real baseada em sensores IR:
-
-- Mantém centralização do robô na passagem
-- Post detection: Identifica bordas de paredes e reseta a odometria global para a grade
-- Reduz erro acumulado durante movimentos longos
+1.  **Exploração (Flood Fill / BFS):** Utiliza *Breadth-First Search* para criar um mapa de custos (gradiente) e identificar a célula não visitada mais próxima, garantindo exploração sistemática.
+2.  **Otimização de Dead-Ends:** Detecta becos sem saída e insere paredes virtuais no mapa, impedindo que o planejador perca tempo revisitando essas áreas.
+3.  **Speed Run (DFS + Pruning):** Para a corrida final, utiliza *Depth-First Search* com poda heurística. Diferente do BFS, este algoritmo minimiza o **tempo estimado** (considerando aceleração e curvas), e não apenas a distância geométrica.
 
 ---
 
-## Modos de Execução
+## Controle e Movimento
 
-O robô opera em três modos durante uma corrida:
+A execução física das trajetórias é gerenciada pelo `ActionQueuer` e pelo `SpeedController`, que convertem o caminho abstrato em tensão nos motores.
 
-### 1. Exploração
+### Pipeline de Ações
 
-- **Objetivo:** Mapear o labirinto progredindo para o centro
-- **Decisões:** Dinâmicas - Action Queue preenchida com 1-2 ações à frente
-- **Dinâmica:** Conservadora (aceleração menor, velocidades moderadas)
-- **Seguimento de parede:** Habilitado
-- **Duração:** ~2-3 minutos
+O `ActionQueuer` processa a rota em etapas de otimização:
 
-### 2. Retorno ao Início
+1.  **Diagonalização:** Identifica padrões em "L" e os converte em movimentos diagonais (45°), reduzindo a distância percorrida.
+2.  **Fusão:** Mescla movimentos lineares consecutivos para permitir aceleração até a velocidade máxima.
+3.  **Trimming (Curvas Contínuas):** Calcula a distância exata antes e depois de uma esquina para iniciar a curva sem parar o robô.
 
-- **Objetivo:** Voltar ao ponto de partida
-- **Mesma lógica:** Dinamicamente replanejado, mas com costmap otimizado para o início
-- **Duração:** ~1-2 minutos
+### Dinâmica de Curvas
 
-### 3. Solve (Corrida de Velocidade)
+Para realizar curvas em alta velocidade, o sistema utiliza uma aproximação numérica baseada em integrais de Fresnel. Isso permite calcular a **velocidade angular máxima** permitida para qualquer raio de curva, garantindo que a aceleração centrípeta se mantenha dentro dos limites de atrito dos pneus.
 
-- **Objetivo:** Executar a rota pré-computada mais rápida
-- **Decisões:** Nenhuma - rota totalmente pré-compilada
-- **Dinâmica:** Agressiva (aceleração máxima, velocidades altas, raios de curvatura reduzidos)
-- **Seguimento de parede:** Desabilitado
-- **Todas as otimizações:** Ativas (diagonais, consolidação, suavização de curvas)
-- **Duração:** ~30-60 segundos
-- **Repetibilidade:** Alta - mesma rota executada consistentemente
+### Controlador Feed-Forward
 
----
+O controle de velocidade abandonou a abordagem puramente reativa (PID) por uma arquitetura híbrida **Feed-Forward**:
 
-## Resumo de Algoritmos
+$$u(t) = \underbrace{K_v \cdot v_{ref}(t) + K_a \cdot a_{ref}(t)}_{\text{Preditivo (Modelo Físico)}} + \underbrace{\text{PID}(e)}_{\text{Corretivo}}$$
 
-| **Componente** | **Algoritmo** | **Benefício** |
-|---|---|---|
-| Odometria | Differential Drive + Butterworth | Sensor fusion suave, reduz ruído |
-| Costmap | Flood Fill (BFS) | O(n), ótimo para grids uniformes |
-| Exploração | BFS Frontier + Gradient Descent | Descobre labirinto minimizando backtracking |
-| Rota Ótima | DFS + Heurística | Otimização de tempo real (não apenas células) |
-| Sequenciação | Pipeline 6-estágios | Consolidação, diagonais, suavização de curvas |
-| Perfis | Trapezoidal + Triangular | Parada precisa, aceleração sem jerk |
-| Controle Motor | Feed-Forward + PID | Rastreamento preciso de velocidade |
-
----
-
-## Loop de Controle
-
-O sistema executa em **frequência fixa (1000 Hz, 1 ms por ciclo)**:
-
-1. Atualizar odometria
-2. Obter velocidades desejadas da ação atual
-3. Verificar se a ação foi concluída
-4. SpeedController computa comandos motores
-5. Enviar PWM aos drivers dos motores
+* **Preditivo:** Calcula a tensão necessária baseada no modelo físico do motor (inércia e força contra-eletromotriz).
+* **Corretivo:** O PID atua apenas sobre pequenos erros e distúrbios, resultando em uma resposta muito mais rápida e estável.
